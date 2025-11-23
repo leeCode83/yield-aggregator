@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.30;
+pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "./interfaces/IVault.sol";
 
 /**
  * @title Router
@@ -19,9 +18,21 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
     // ============ Enums ============
 
     enum RiskLevel {
-        Conservative,
-        Balanced,
-        Aggressive
+        Conservative, // 0
+        Balanced, // 1
+        Aggressive // 2
+    }
+
+    // ============ Structs ============
+
+    struct UserDeposit {
+        uint256 amount;
+        uint256 timestamp;
+    }
+
+    struct UserWithdraw {
+        uint256 shares;
+        uint256 timestamp;
     }
 
     // ============ State Variables ============
@@ -32,15 +43,25 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
     // Vault addresses per risk level
     mapping(RiskLevel => address) public vaults;
 
-    // Pending deposits: user => RiskLevel => amount
-    mapping(address => mapping(RiskLevel => uint256)) public pendingDeposits;
+    // Pending deposits: user => RiskLevel => deposit info
+    mapping(address => mapping(RiskLevel => UserDeposit))
+        public pendingDeposits;
 
-    // Pending withdraws: user => RiskLevel => shares amount
-    mapping(address => mapping(RiskLevel => uint256)) public pendingWithdraws;
+    // Pending withdraws: user => RiskLevel => withdraw info
+    mapping(address => mapping(RiskLevel => UserWithdraw))
+        public pendingWithdraws;
 
-    // Total pending per risk level untuk batching
+    // Total pending amounts per risk level
     mapping(RiskLevel => uint256) public totalPendingDeposits;
     mapping(RiskLevel => uint256) public totalPendingWithdraws;
+
+    // List of users dengan pending deposits/withdraws (untuk batch processing)
+    mapping(RiskLevel => address[]) public depositUsers;
+    mapping(RiskLevel => address[]) public withdrawUsers;
+
+    // Track if user sudah di list (untuk avoid duplicates)
+    mapping(address => mapping(RiskLevel => bool)) public isInDepositList;
+    mapping(address => mapping(RiskLevel => bool)) public isInWithdrawList;
 
     // Batch timing - deposits/withdraws executed setiap X hours
     uint256 public batchInterval = 6 hours;
@@ -65,18 +86,34 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
         uint256 nextBatchTime
     );
 
-    event BatchExecuted(
+    event BatchDepositsExecuted(
         RiskLevel indexed riskLevel,
-        uint256 totalDeposits,
-        uint256 totalWithdraws,
+        uint256 totalAmount,
+        uint256 userCount,
+        uint256 timestamp
+    );
+
+    event BatchWithdrawsExecuted(
+        RiskLevel indexed riskLevel,
+        uint256 totalShares,
+        uint256 totalAssets,
+        uint256 userCount,
         uint256 timestamp
     );
 
     event VaultSet(RiskLevel indexed riskLevel, address vaultAddress);
-
     event MinDepositAmountUpdated(uint256 newAmount);
-
     event BatchIntervalUpdated(uint256 newInterval);
+    event DepositClaimed(
+        address indexed user,
+        RiskLevel indexed riskLevel,
+        uint256 shares
+    );
+    event WithdrawClaimed(
+        address indexed user,
+        RiskLevel indexed riskLevel,
+        uint256 assets
+    );
 
     // ============ Constructor ============
 
@@ -108,8 +145,18 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
         // Transfer USDC from user to Router
         usdc.safeTransferFrom(msg.sender, address(this), amount);
 
+        // Update atau add pending deposit
+        if (pendingDeposits[msg.sender][riskLevel].amount == 0) {
+            // First deposit untuk risk level ini
+            if (!isInDepositList[msg.sender][riskLevel]) {
+                depositUsers[riskLevel].push(msg.sender);
+                isInDepositList[msg.sender][riskLevel] = true;
+            }
+        }
+
         // Add to pending deposits
-        pendingDeposits[msg.sender][riskLevel] += amount;
+        pendingDeposits[msg.sender][riskLevel].amount += amount;
+        pendingDeposits[msg.sender][riskLevel].timestamp = block.timestamp;
         totalPendingDeposits[riskLevel] += amount;
 
         // Calculate next batch time
@@ -130,19 +177,32 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
         RiskLevel riskLevel
     ) external nonReentrant whenNotPaused {
         require(shares > 0, "Shares must be > 0");
-        require(vaults[riskLevel] != address(0), "Vault not set");
-
-        address vault = vaults[riskLevel];
+        address vaultAddress = vaults[riskLevel];
+        require(vaultAddress != address(0), "Vault not set");
 
         // Check user has enough shares
-        uint256 userShares = IERC20(vault).balanceOf(msg.sender);
+        uint256 userShares = IERC20(vaultAddress).balanceOf(msg.sender);
         require(userShares >= shares, "Insufficient shares");
 
         // Transfer shares from user to Router
-        IERC20(vault).safeTransferFrom(msg.sender, address(this), shares);
+        IERC20(vaultAddress).safeTransferFrom(
+            msg.sender,
+            address(this),
+            shares
+        );
+
+        // Update atau add pending withdraw
+        if (pendingWithdraws[msg.sender][riskLevel].shares == 0) {
+            // First withdraw untuk risk level ini
+            if (!isInWithdrawList[msg.sender][riskLevel]) {
+                withdrawUsers[riskLevel].push(msg.sender);
+                isInWithdrawList[msg.sender][riskLevel] = true;
+            }
+        }
 
         // Add to pending withdraws
-        pendingWithdraws[msg.sender][riskLevel] += shares;
+        pendingWithdraws[msg.sender][riskLevel].shares += shares;
+        pendingWithdraws[msg.sender][riskLevel].timestamp = block.timestamp;
         totalPendingWithdraws[riskLevel] += shares;
 
         // Calculate next batch time
@@ -150,6 +210,51 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
 
         emit WithdrawQueued(msg.sender, riskLevel, shares, nextBatch);
     }
+
+    // ============ Claim Functions ============
+
+    /**
+     * @notice User claim shares setelah deposit batch executed
+     * @param riskLevel Risk level vault
+     * @dev Shares sudah di-mint ke Router saat batch, user claim untuk transfer ke wallet
+     */
+    function claimDepositShares(RiskLevel riskLevel) external nonReentrant {
+        address vaultAddress = vaults[riskLevel];
+        require(vaultAddress != address(0), "Vault not set");
+
+        // Check apakah user punya shares yang bisa diclaim
+        uint256 routerShares = IERC20(vaultAddress).balanceOf(address(this));
+        require(routerShares > 0, "No shares to claim");
+
+        // Untuk simplicity, kita assume shares didistribusikan proporsional
+        // Dalam production, perlu tracking lebih detail per user
+        // Untuk demo, kita transfer available shares ke user
+
+        uint256 userPendingDeposit = pendingDeposits[msg.sender][riskLevel]
+            .amount;
+        require(userPendingDeposit == 0, "Deposit not yet executed");
+
+        // Note: Ini simplified version
+        // Production perlu proper accounting untuk track shares per user
+        emit DepositClaimed(msg.sender, riskLevel, 0);
+    }
+
+    /**
+     * @notice User claim USDC setelah withdraw batch executed
+     * @param riskLevel Risk level vault
+     */
+    function claimWithdrawAssets(RiskLevel riskLevel) external nonReentrant {
+        // Check apakah user punya USDC yang bisa diclaim
+        uint256 userPendingWithdraw = pendingWithdraws[msg.sender][riskLevel]
+            .shares;
+        require(userPendingWithdraw == 0, "Withdraw not yet executed");
+
+        // Note: Ini simplified version
+        // Production perlu proper accounting untuk track USDC per user
+        emit WithdrawClaimed(msg.sender, riskLevel, 0);
+    }
+
+    // ============ View Functions ============
 
     /**
      * @notice Get user's pending deposit amount untuk risk level tertentu
@@ -160,8 +265,8 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
     function getPendingDeposit(
         address user,
         RiskLevel riskLevel
-    ) external view returns (uint256) {
-        return pendingDeposits[user][riskLevel];
+    ) external view returns (uint256 amount) {
+        return pendingDeposits[user][riskLevel].amount;
     }
 
     /**
@@ -173,8 +278,8 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
     function getPendingWithdraw(
         address user,
         RiskLevel riskLevel
-    ) external view returns (uint256) {
-        return pendingWithdraws[user][riskLevel];
+    ) external view returns (uint256 shares) {
+        return pendingWithdraws[user][riskLevel].shares;
     }
 
     /**
@@ -184,7 +289,7 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
      */
     function getNextBatchTime(
         RiskLevel riskLevel
-    ) external view returns (uint256) {
+    ) external view returns (uint256 nextBatchTime) {
         return lastBatchTime[riskLevel] + batchInterval;
     }
 
@@ -193,8 +298,32 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
      * @param riskLevel Risk level to check
      * @return ready True jika batch interval sudah lewat
      */
-    function isBatchReady(RiskLevel riskLevel) public view returns (bool) {
+    function isBatchReady(
+        RiskLevel riskLevel
+    ) public view returns (bool ready) {
         return block.timestamp >= lastBatchTime[riskLevel] + batchInterval;
+    }
+
+    /**
+     * @notice Get jumlah users dalam deposit queue
+     * @param riskLevel Risk level to check
+     * @return count Number of users
+     */
+    function getDepositUserCount(
+        RiskLevel riskLevel
+    ) external view returns (uint256 count) {
+        return depositUsers[riskLevel].length;
+    }
+
+    /**
+     * @notice Get jumlah users dalam withdraw queue
+     * @param riskLevel Risk level to check
+     * @return count Number of users
+     */
+    function getWithdrawUserCount(
+        RiskLevel riskLevel
+    ) external view returns (uint256 count) {
+        return withdrawUsers[riskLevel].length;
     }
 
     // ============ Keeper Functions ============
@@ -207,7 +336,7 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
      */
     function executeBatchDeposits(
         RiskLevel riskLevel
-    ) external nonReentrant whenNotPaused {
+    ) public nonReentrant whenNotPaused {
         require(isBatchReady(riskLevel), "Batch not ready yet");
         require(totalPendingDeposits[riskLevel] > 0, "No pending deposits");
 
@@ -215,21 +344,53 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
         require(vaultAddress != address(0), "Vault not set");
 
         uint256 totalAmount = totalPendingDeposits[riskLevel];
+        uint256 userCount = depositUsers[riskLevel].length;
 
         // Approve vault to spend USDC
         usdc.approve(vaultAddress, totalAmount);
 
-        // Call vault's deposit function using interface
-        IVault vault = IVault(vaultAddress);
-        uint256 sharesMinted = vault.deposit(totalAmount);
+        // Call vault's deposit function
+        (bool success, bytes memory returnData) = vaultAddress.call(
+            abi.encodeWithSignature("deposit(uint256)", totalAmount)
+        );
+        require(success, "Vault deposit failed");
 
+        // Decode shares minted
+        uint256 sharesMinted = abi.decode(returnData, (uint256));
         require(sharesMinted > 0, "No shares minted");
 
-        // Reset pending deposits
+        // Clear pending deposits untuk semua users
+        address[] memory users = depositUsers[riskLevel];
+        for (uint256 i = 0; i < users.length; i++) {
+            address user = users[i];
+
+            // Transfer shares proporsional ke user
+            uint256 userAmount = pendingDeposits[user][riskLevel].amount;
+            if (userAmount > 0) {
+                uint256 userShares = (sharesMinted * userAmount) / totalAmount;
+
+                // Transfer shares dari Router ke user
+                IERC20(vaultAddress).safeTransfer(user, userShares);
+
+                // Clear pending deposit
+                delete pendingDeposits[user][riskLevel];
+                isInDepositList[user][riskLevel] = false;
+            }
+        }
+
+        // Reset totals dan lists
         totalPendingDeposits[riskLevel] = 0;
+        delete depositUsers[riskLevel];
+
+        // Update last batch time
         lastBatchTime[riskLevel] = block.timestamp;
 
-        emit BatchExecuted(riskLevel, totalAmount, 0, block.timestamp);
+        emit BatchDepositsExecuted(
+            riskLevel,
+            totalAmount,
+            userCount,
+            block.timestamp
+        );
     }
 
     /**
@@ -239,7 +400,7 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
      */
     function executeBatchWithdraws(
         RiskLevel riskLevel
-    ) external nonReentrant whenNotPaused {
+    ) public nonReentrant whenNotPaused {
         require(isBatchReady(riskLevel), "Batch not ready yet");
         require(totalPendingWithdraws[riskLevel] > 0, "No pending withdraws");
 
@@ -247,21 +408,53 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
         require(vaultAddress != address(0), "Vault not set");
 
         uint256 totalShares = totalPendingWithdraws[riskLevel];
+        uint256 userCount = withdrawUsers[riskLevel].length;
 
-        // Call vault's redeem function using interface
-        IVault vault = IVault(vaultAddress);
-        uint256 usdcReceived = vault.redeem(totalShares);
+        // Approve vault shares (already in Router)
+        IERC20(vaultAddress).approve(vaultAddress, totalShares);
 
+        // Call vault's redeem function
+        (bool success, bytes memory returnData) = vaultAddress.call(
+            abi.encodeWithSignature("redeem(uint256)", totalShares)
+        );
+        require(success, "Vault redeem failed");
+
+        // Decode USDC received
+        uint256 usdcReceived = abi.decode(returnData, (uint256));
         require(usdcReceived > 0, "No USDC received");
 
-        // USDC will be distributed to users proportionally
-        // (Implementation detail: bisa via separate claim function atau auto-transfer)
+        // Distribute USDC proporsional ke users
+        address[] memory users = withdrawUsers[riskLevel];
+        for (uint256 i = 0; i < users.length; i++) {
+            address user = users[i];
 
-        // Reset pending withdraws
+            uint256 userShares = pendingWithdraws[user][riskLevel].shares;
+            if (userShares > 0) {
+                uint256 userUSDC = (usdcReceived * userShares) / totalShares;
+
+                // Transfer USDC dari Router ke user
+                usdc.safeTransfer(user, userUSDC);
+
+                // Clear pending withdraw
+                delete pendingWithdraws[user][riskLevel];
+                isInWithdrawList[user][riskLevel] = false;
+            }
+        }
+
+        // Reset totals dan lists
         totalPendingWithdraws[riskLevel] = 0;
+        delete withdrawUsers[riskLevel];
+
+        // Update last batch time
         lastBatchTime[riskLevel] = block.timestamp;
 
-        emit BatchExecuted(riskLevel, 0, usdcReceived, block.timestamp);
+        emit BatchWithdrawsExecuted(
+            riskLevel,
+            totalShares,
+            usdcReceived,
+            userCount,
+            block.timestamp
+        );
     }
 
     /**
@@ -279,11 +472,34 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
         require(hasDeposits || hasWithdraws, "No pending transactions");
 
         if (hasDeposits) {
-            this.executeBatchDeposits(riskLevel);
+            executeBatchDeposits(riskLevel);
         }
 
         if (hasWithdraws) {
-            this.executeBatchWithdraws(riskLevel);
+            executeBatchWithdraws(riskLevel);
+        }
+    }
+
+    /**
+     * @notice Execute batch untuk semua risk levels sekaligus
+     * @dev Untuk efficiency, execute semua yang ready dalam 1 transaction
+     */
+    function executeBatchAll() external nonReentrant whenNotPaused {
+        for (uint256 i = 0; i < 3; i++) {
+            RiskLevel risk = RiskLevel(i);
+
+            if (isBatchReady(risk)) {
+                bool hasDeposits = totalPendingDeposits[risk] > 0;
+                bool hasWithdraws = totalPendingWithdraws[risk] > 0;
+
+                if (hasDeposits) {
+                    executeBatchDeposits(risk);
+                }
+
+                if (hasWithdraws) {
+                    executeBatchWithdraws(risk);
+                }
+            }
         }
     }
 
@@ -302,7 +518,7 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
         require(vaultAddress != address(0), "Invalid vault address");
         vaults[riskLevel] = vaultAddress;
 
-        // Initialize last batch time
+        // Initialize last batch time jika belum di-set
         if (lastBatchTime[riskLevel] == 0) {
             lastBatchTime[riskLevel] = block.timestamp;
         }
@@ -329,6 +545,25 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
         require(newInterval <= 24 hours, "Interval too long");
         batchInterval = newInterval;
         emit BatchIntervalUpdated(newInterval);
+    }
+
+    /**
+     * @notice Force execute batch bahkan sebelum interval (untuk testing/emergency)
+     * @param riskLevel Risk level to force execute
+     */
+    function forceExecuteBatch(RiskLevel riskLevel) external onlyOwner {
+        bool hasDeposits = totalPendingDeposits[riskLevel] > 0;
+        bool hasWithdraws = totalPendingWithdraws[riskLevel] > 0;
+
+        require(hasDeposits || hasWithdraws, "No pending transactions");
+
+        if (hasDeposits) {
+            executeBatchDeposits(riskLevel);
+        }
+
+        if (hasWithdraws) {
+            executeBatchWithdraws(riskLevel);
+        }
     }
 
     /**
@@ -360,51 +595,52 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @notice Preview berapa shares yang akan user terima untuk deposit amount
-     * @param amount Jumlah USDC yang akan di-deposit
-     * @param riskLevel Risk level vault
-     * @return shares Estimasi shares yang akan diterima
+     * @notice Cancel pending deposit (emergency untuk user)
+     * @param user User address
+     * @param riskLevel Risk level
+     * @dev Only owner untuk handle emergency user requests
      */
-    function previewDeposit(
-        uint256 amount,
+    function cancelPendingDeposit(
+        address user,
         RiskLevel riskLevel
-    ) external view returns (uint256) {
-        address vaultAddress = vaults[riskLevel];
-        require(vaultAddress != address(0), "Vault not set");
+    ) external onlyOwner {
+        uint256 amount = pendingDeposits[user][riskLevel].amount;
+        require(amount > 0, "No pending deposit");
 
-        IVault vault = IVault(vaultAddress);
-        return vault.previewDeposit(amount);
+        // Return USDC to user
+        usdc.safeTransfer(user, amount);
+
+        // Update totals
+        totalPendingDeposits[riskLevel] -= amount;
+
+        // Clear pending
+        delete pendingDeposits[user][riskLevel];
+        isInDepositList[user][riskLevel] = false;
     }
 
     /**
-     * @notice Preview berapa USDC yang akan user terima untuk redeem shares
-     * @param shares Jumlah shares yang akan di-redeem
-     * @param riskLevel Risk level vault
-     * @return assets Estimasi USDC yang akan diterima
+     * @notice Cancel pending withdraw (emergency untuk user)
+     * @param user User address
+     * @param riskLevel Risk level
+     * @dev Only owner untuk handle emergency user requests
      */
-    function previewWithdraw(
-        uint256 shares,
+    function cancelPendingWithdraw(
+        address user,
         RiskLevel riskLevel
-    ) external view returns (uint256) {
+    ) external onlyOwner {
+        uint256 shares = pendingWithdraws[user][riskLevel].shares;
+        require(shares > 0, "No pending withdraw");
+
         address vaultAddress = vaults[riskLevel];
-        require(vaultAddress != address(0), "Vault not set");
 
-        IVault vault = IVault(vaultAddress);
-        return vault.previewRedeem(shares);
-    }
+        // Return shares to user
+        IERC20(vaultAddress).safeTransfer(user, shares);
 
-    /**
-     * @notice Get total value of vault dalam USDC
-     * @param riskLevel Risk level vault
-     * @return totalValue Total USDC value di vault
-     */
-    function getVaultTotalValue(
-        RiskLevel riskLevel
-    ) external view returns (uint256) {
-        address vaultAddress = vaults[riskLevel];
-        require(vaultAddress != address(0), "Vault not set");
+        // Update totals
+        totalPendingWithdraws[riskLevel] -= shares;
 
-        IVault vault = IVault(vaultAddress);
-        return vault.totalAssets();
+        // Clear pending
+        delete pendingWithdraws[user][riskLevel];
+        isInWithdrawList[user][riskLevel] = false;
     }
 }
